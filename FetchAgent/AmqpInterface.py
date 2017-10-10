@@ -18,13 +18,14 @@ import cachetools
 class RabbitQueueHandler(object):
 	die = False
 
-	def __init__(self, settings, mdict):
+	def __init__(self, settings, mdict, interface_lock):
 
 		self.logPath = 'Main.Feeds.RPC'
 
 		self.log = logging.getLogger(self.logPath)
 		self.log.info("RPC Management class instantiated.")
 		self.mdict = mdict
+		self.interface_lock = interface_lock
 
 		self.dispatch_map = {}
 
@@ -81,7 +82,7 @@ class RabbitQueueHandler(object):
 				)
 			# We spread out the socket creation along the timeout interval, so
 			# that all the connectors don't function in apparent lockstep
-			time.sleep(settings['socket_timeout'] / settings['consumer_threads'])
+			# time.sleep(settings['socket_timeout'] / settings['consumer_threads'])
 
 
 		# The chunk structure is slightly annoying, so just limit to 200 partial messages.
@@ -248,21 +249,26 @@ class RabbitQueueHandler(object):
 
 
 	def dispatch_outgoing(self):
+		int_name = self.settings['taskq_name']
 
-		for qname, q in self.mdict[self.settings['taskq_name']].items():
-			while not q.empty():
-				try:
-					job = q.get_nowait()
-					jkey = uuid.uuid1().hex
-					job['jobmeta'] = {
-						'sort_key' : jkey,
-						'qname'    : qname,
-						}
-					self.mon_con.incr("Fetch.Get.{}".format(qname), 1)
-					self.dispatch_map[jkey] = (qname, time.time())
-					self.put_job(job)
-				except queue.Empty:
-					break
+
+		for qname in self.mdict[int_name].keys():
+			while self.mdict[int_name][qname]:
+				with self.interface_lock:
+					if self.mdict[int_name][qname]:
+						job = self.mdict[int_name][qname].pop()
+					else:
+						return
+
+				jkey = uuid.uuid1().hex
+				job['jobmeta'] = {
+					'sort_key' : jkey,
+					'qname'    : qname,
+					}
+				self.mon_con.incr("Fetch.Get.{}".format(qname), 1)
+				self.dispatch_map[jkey] = (qname, time.time())
+				self.put_job(job)
+
 
 	def process_retreived(self):
 		while True:
@@ -302,7 +308,9 @@ class RabbitQueueHandler(object):
 				self.log.error("Queue name: '%s'", qname)
 				continue
 
-			self.mdict[self.settings['respq_name']][qname].put(new)
+
+			with self.interface_lock:
+				self.mdict[self.settings['respq_name']][qname].append(new)
 
 			if started_at:
 				fetchtime = (time.time() - started_at) * 1000
@@ -331,13 +339,14 @@ class RabbitQueueHandler(object):
 class PlainRabbitQueueHandler(object):
 	die = False
 
-	def __init__(self, settings, mdict):
+	def __init__(self, settings, mdict, interface_lock):
 
 		self.logPath = 'Main.Feeds.RPC'
 
 		self.log = logging.getLogger(self.logPath)
 		self.log.info("RPC Management class instantiated.")
 		self.mdict = mdict
+		self.interface_lock = interface_lock
 
 		self.dispatch_map = {}
 
@@ -438,14 +447,16 @@ class PlainRabbitQueueHandler(object):
 
 
 	def dispatch_outgoing(self):
-		qname = self.settings['taskq_name']
-		while not self.mdict[qname].empty():
-			try:
-				job = self.mdict[qname].get_nowait()
-				self.put_job(job)
-				self.mon_con.incr("Feed.Put.{}".format(qname), 1)
-			except queue.Empty:
-				break
+		int_name = self.settings['taskq_name']
+
+		while self.mdict[int_name]:
+			with self.interface_lock:
+				if self.mdict[int_name]:
+					job = self.mdict[int_name].pop()
+				else:
+					return
+			self.put_job(job)
+			self.mon_con.incr("Feed.Put.{}".format(int_name), 1)
 
 	def process_retreived(self):
 		qname = self.settings['respq_name']
@@ -455,7 +466,9 @@ class PlainRabbitQueueHandler(object):
 			if not new:
 				# print("No job item?", new)
 				return
-			self.mdict[qname].put(new)
+
+			with self.interface_lock:
+				self.mdict[qname].append(new)
 
 			self.mon_con.incr("Feed.Recv.{}".format(qname), 1)
 
@@ -489,7 +502,7 @@ def monitor(manager):
 
 
 # Note:
-def startup_interface(manager):
+def startup_interface(manager, interface_lock):
 	rpc_amqp_settings = {
 		'consumer_threads'        : 4,
 
@@ -561,11 +574,11 @@ def startup_interface(manager):
 		'ack_rx'                  : True
 	}
 
-	STATE['rpc_instance'] = RabbitQueueHandler(rpc_amqp_settings, manager)
+	STATE['rpc_instance'] = RabbitQueueHandler(rpc_amqp_settings, manager, interface_lock)
 	STATE['rpc_thread'] = threading.Thread(target=STATE['rpc_instance'].runner)
 	STATE['rpc_thread'].start()
 
-	STATE['feed_instance'] = PlainRabbitQueueHandler(feed_amqp_settings, manager)
+	STATE['feed_instance'] = PlainRabbitQueueHandler(feed_amqp_settings, manager, interface_lock)
 	STATE['feed_thread'] = threading.Thread(target=STATE['feed_instance'].runner)
 	STATE['feed_thread'].start()
 
@@ -573,7 +586,7 @@ def startup_interface(manager):
 	STATE['monitor_thread'].start()
 
 
-def shutdown_interface(manager):
+def shutdown_interface(manager, interface_lock):
 	print("Halting AMQP interface")
 	manager['amqp_runstate'] = False
 	STATE['rpc_thread'].join()
