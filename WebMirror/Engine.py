@@ -21,6 +21,7 @@ from sqlalchemy import desc
 from sqlalchemy.sql import text
 from sqlalchemy import distinct
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql.expression import exists
 
 import common.util.urlFuncs
 import urllib.parse
@@ -75,7 +76,7 @@ def getHash(fCont):
 NETLOC_BADWORDS_LOOKUP_CACHE = cachetools.LRUCache(maxsize=1000)
 
 
-def saveCoverFile(filecont, fHash, filename):
+def save_binary_file(filecont, fHash, filename):
 	# use the first 3 chars of the hash for the folder name.
 	# Since it's hex-encoded, that gives us a max of 2^12 bits of
 	# directories, or 4096 dirs.
@@ -88,10 +89,6 @@ def saveCoverFile(filecont, fHash, filename):
 
 	ext = os.path.splitext(filename)[-1]
 	ext   = ext.lower()
-
-	# The "." is part of the ext.
-	filename = '{filename}{ext}'.format(filename=fHash, ext=ext)
-
 
 	# The "." is part of the ext.
 	filename = '{filename}{ext}'.format(filename=fHash, ext=ext)
@@ -306,10 +303,9 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 
 		ctbl = version_table(db.WebPages.__table__)
 
-		count = self.db_sess.query(ctbl) \
-			.filter(ctbl.c.url == url)   \
-			.count()
-		return count
+		query = self.db_sess.query(exists().where(ctbl.c.url == url))
+
+		return query.scalar()
 
 
 	# Update the row with the item contents
@@ -324,20 +320,18 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		ignoreuntiltime = (datetime.datetime.now() + datetime.timedelta(days=interval))
 
 		while True:
-			history_size = self.checkHaveHistory(job.url)
-			if history_size > 0:
+			have_history = self.checkHaveHistory(job.url)
+			if have_history:
 				break
 			try:
-				self.log.info("Need to push content into history table (current length: %s).", history_size)
+				self.log.info("Need to push content into history table.")
 				job.state     = "complete"
 				job.fetchtime = datetime.datetime.now() - datetime.timedelta(days=1)
 
 				self.db_sess.commit()
 				self.log.info("Pushing old job content into history table!")
 				break
-			except sqlalchemy.exc.OperationalError:
-				self.db_sess.rollback()
-			except sqlalchemy.exc.InvalidRequestError:
+			except (sqlalchemy.exc.InvalidRequestError, sqlalchemy.exc.OperationalError, sqlalchemy.exc.IntegrityError):
 				self.db_sess.rollback()
 
 
@@ -396,11 +390,13 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 				self.db_sess.rollback()
 				if tries > 5:
 					traceback.print_exc()
+					raise
 			except sqlalchemy.exc.InvalidRequestError:
 				self.log.warning("sqlalchemy.exc.InvalidRequestError!")
 				self.db_sess.rollback()
 				if tries > 5:
 					traceback.print_exc()
+					raise
 			except Exception as e:
 				print("Exception!")
 				print(traceback.print_exc())
@@ -480,7 +476,7 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		if start in self.netloc_rewalk_times:
 			interval = self.netloc_rewalk_times[start]
 		ignoreuntiltime = (datetime.datetime.now() + datetime.timedelta(days=interval))
-		print("[upsertFileResponse] Ignore until: ", ignoreuntiltime)
+		print("[upsertRssItems] Ignore until: ", ignoreuntiltime)
 
 		while 1:
 			try:
@@ -541,6 +537,12 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 			return None
 		if link.startswith("clsid:"):
 			return None
+
+		link = common.util.urlFuncs.cleanUrl(link)
+		if not link:
+			return None
+
+
 		linkl = link.lower()
 		if any([badword in linkl for badword in badwords]):
 			return None
@@ -812,8 +814,11 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		ignoreuntiltime = (datetime.datetime.now() + datetime.timedelta(days=interval))
 		print("[upsertFileResponse] Ignore until: ", ignoreuntiltime)
 
+		tries = 0
+
 		while 1:
 			try:
+				tries += 1
 				# Look for existing files with the same MD5sum. If there are any, just point the new file at the
 				# fsPath of the existing one, rather then creating a new file on-disk.
 				have = self.db_sess.query(self.db.WebFiles) \
@@ -839,7 +844,7 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 						self.db_sess.commit()
 						job.file = new.id
 				else:
-					savedpath = saveCoverFile(response['content'], fHash, response['fName'])
+					savedpath = save_binary_file(response['content'], fHash, response['fName'])
 					new = self.db.WebFiles(
 						filename = response['fName'],
 						fhash    = fHash,
@@ -858,10 +863,12 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 
 				job.mimetype = response['mimeType']
 				self.db_sess.commit()
-				break
-			except sqlalchemy.exc.OperationalError:
-				self.db_sess.rollback()
-			except sqlalchemy.exc.InvalidRequestError:
+				return
+			except (sqlalchemy.exc.InvalidRequestError, sqlalchemy.exc.OperationalError, sqlalchemy.exc.IntegrityError):
+				if tries > 5:
+					self.db_sess.expire_all()
+				if tries > 10:
+					raise
 				self.db_sess.rollback()
 		# print("have:", have)
 
@@ -1122,11 +1129,7 @@ class SiteArchiver(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 
 				self.db_sess.commit()
 				break
-			except sqlalchemy.exc.InvalidRequestError:
-				self.db_sess.rollback()
-			except sqlalchemy.exc.OperationalError:
-				self.db_sess.rollback()
-			except sqlalchemy.exc.IntegrityError:
+			except (sqlalchemy.exc.InvalidRequestError, sqlalchemy.exc.OperationalError, sqlalchemy.exc.IntegrityError):
 				self.db_sess.rollback()
 
 
@@ -1298,12 +1301,26 @@ def test3():
 	# 	pipe.incr('filtered_links',      count=filtered)
 	# 	pipe.incr('upserted_links',      count=batch_items)
 
+def test_4():
+
+	with common.database.session_context() as db_handle:
+		archiver = SiteArchiver(
+				None,       # cookie_lock
+				db_handle,  # db_interface
+				None,       # new_job_queue
+			)
+		print(archiver)
+		url = 'http://www.aihristdreamtranslations.com/feed/'
+
+		archiver.checkHaveHistory(url)
+
+
 
 
 if __name__ == "__main__":
 	import logSetup
 	logSetup.initLogging()
 
-	test3()
+	test_4()
 
 

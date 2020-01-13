@@ -1487,7 +1487,6 @@ baseUrl: [
 	'http://narou-tl.com',
 	'http://nightbreezetranslations.com',
 	'http://noodletowntranslated.com',
-	'http://novel.gilegati.com',
 	'http://novelcv.com',
 	'http://novellatranslation.com',
 	'http://novels.heartnhabit.com',
@@ -1784,6 +1783,10 @@ baseUrl: [
 
 
 	]
+
+
+
+www_no_www_same: True
 
 
 

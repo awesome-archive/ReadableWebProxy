@@ -51,14 +51,16 @@ if "twoprocess" in largv or "oneprocess" in largv:
 	MAX_IN_FLIGHT_JOBS = 2
 else:
 	# MAX_IN_FLIGHT_JOBS = 5
-	MAX_IN_FLIGHT_JOBS = 75
+	MAX_IN_FLIGHT_JOBS = 15
+	# MAX_IN_FLIGHT_JOBS = 40
+	# MAX_IN_FLIGHT_JOBS = 75
 	# MAX_IN_FLIGHT_JOBS = 250
 	# MAX_IN_FLIGHT_JOBS = 500
 	# MAX_IN_FLIGHT_JOBS = 1000
 	# MAX_IN_FLIGHT_JOBS = 3000
 
 
-LOCAL_ENQUEUED_JOB_RESPONSES = 50
+LOCAL_ENQUEUED_JOB_RESPONSES = 5
 
 class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 
@@ -84,14 +86,16 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 
 		# This queue has to be a multiprocessing queue, because it's shared across multiple processes.
 		self.normal_out_queue  = multiprocessing.Queue(maxsize=MAX_IN_FLIGHT_JOBS * 2)
-		self.fetch_procs = [
-			threading.Thread(target=self.filler_run_shim, args=('priority', )),
-			threading.Thread(target=self.filler_run_shim, args=('new_fetch', )),
-			threading.Thread(target=self.filler_run_shim, args=('random', )),
-			threading.Thread(target=self.drainer_run_shim),
-		]
+		self.fetch_procs = {
+			"filler-priority"  : threading.Thread(target=self.filler_run_shim, args=('priority', )),
+			"filler-new_fetch" : threading.Thread(target=self.filler_run_shim, args=('new_fetch', )),
+			"filler-random"    : threading.Thread(target=self.filler_run_shim, args=('random', )),
+			"consumer"         : threading.Thread(target=self.drainer_run_shim),
+			"consumer"         : threading.Thread(target=self.drainer_run_shim),
+			"consumer"         : threading.Thread(target=self.drainer_run_shim),
+		}
 
-		for proc in self.fetch_procs:
+		for proc in self.fetch_procs.values():
 			proc.start()
 
 		self.print_mod = 0
@@ -135,7 +139,7 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 			print("Saw keyboard interrupt. Breaking!")
 			return
 
-		except Exception:
+		except:
 			print("Error!")
 			print("Error!")
 			print("Error!")
@@ -188,22 +192,22 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		self.run_flag.value = 0
 
 		for _ in range(60 * 5):
-			for proc in self.fetch_procs:
-				proc.join(timeout=1)
-				if any([tmp.is_alive() for tmp in self.fetch_procs]) is False:
+			for proc in self.fetch_procs.values():
+				proc.join(1)
+				if any([tmp.is_alive() for tmp in self.fetch_procs.values()]) is False:
 					return
 				self.log.info("Waiting for job dispatcher to join. Currently active jobs in queue: %s, states: %s",
 						self.normal_out_queue.qsize(),
-						[tmp.is_alive() for tmp in self.fetch_procs]
+						[tmp.is_alive() for tmp in self.fetch_procs.values()]
 					)
 
 		while True:
-			for proc in self.fetch_procs:
-				proc.join(timeout=1)
-				if any([tmp.is_alive() for tmp in self.fetch_procs]) is False:
+			for proc in self.fetch_procs.values():
+				proc.join(1)
+				if any([tmp.is_alive() for tmp in self.fetch_procs.values()]) is False:
 					return
 				self.log.error("Timeout when waiting for join. Bulk consuming from intermediate queue. States: %s",
-						[tmp.is_alive() for tmp in self.fetch_procs],
+						[tmp.is_alive() for tmp in self.fetch_procs.values()],
 					)
 				try:
 					while 1:
@@ -213,7 +217,8 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 
 
 	def put_outbound_job(self, jobid, joburl, netloc=None):
-		self.log.info("Dispatching new job (active jobs: %s of %s)", self.active_jobs, MAX_IN_FLIGHT_JOBS)
+		with self.count_lock:
+			self.log.info("Dispatching new job (active jobs: %s of %s)", self.active_jobs, MAX_IN_FLIGHT_JOBS)
 		raw_job = WebMirror.JobUtils.buildjob(
 			module         = 'SmartWebRequest',
 			call           = 'smartGetItem',
@@ -254,10 +259,16 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		if 'drain' in sys.argv:
 			return
 		escape_count = 0
-		while self.active_jobs < MAX_IN_FLIGHT_JOBS and escape_count < 25 and self.normal_out_queue.qsize() < LOCAL_ENQUEUED_JOB_RESPONSES:
+
+		with self.count_lock:
+			current_active = self.active_jobs
+
+		while current_active < MAX_IN_FLIGHT_JOBS and escape_count < 25 and self.normal_out_queue.qsize() < LOCAL_ENQUEUED_JOB_RESPONSES:
 			old = self.normal_out_queue.qsize()
 			num_new = self._get_task_internal(mode)
-			self.log.info("Need to add jobs to the job queue (%s active, %s added)!", self.active_jobs, self.active_jobs-old)
+			with self.count_lock:
+				current_active = self.active_jobs
+				self.log.info("Need to add jobs to the job queue (%s active, %s added)!", self.active_jobs, self.active_jobs-old)
 
 			if self.run_flag.value != 1:
 				return
@@ -280,19 +291,16 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		except Exception:   # pylint: disable=W0703
 			pass
 
-		for _ in range(100):
+		for x in range(100):
 			try:
 				self.local.rpc_interface = common.get_rpyc.RemoteJobInterface("RawMirror")
 				return
 
-			except TypeError:
-				pass
-			except KeyError:
-				pass
-			except socket.timeout:
-				pass
-			except ConnectionRefusedError:
-				pass
+			except (TypeError, KeyError, socket.timeout, ConnectionRefusedError):
+				for line in traceback.format_exc().split("\n"):
+					self.log.error(line)
+				if x > 90:
+					raise RuntimeError("Could not establish connection to RPC remote!")
 
 		raise RuntimeError("Could not establish connection to RPC remote!")
 
@@ -305,6 +313,7 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 				tmp = self.local.rpc_interface.get_job()
 
 				with self.count_lock:
+					print("Handling response!")
 					self.active_jobs -= 1
 					self.jobs_in += 1
 					if self.active_jobs < 0:
@@ -345,8 +354,9 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 				else:
 					self.log.warning("Missing netloc in response extradat!")
 
+				with self.count_lock:
+					self.log.info("Job response received. Jobs in-flight: %s (qsize: %s)", self.active_jobs, self.normal_out_queue.qsize())
 
-				self.log.info("Job response received. Jobs in-flight: %s (qsize: %s)", self.active_jobs, self.normal_out_queue.qsize())
 				self.last_rx = datetime.datetime.now()
 				self.blocking_put_response(("processed", tmp))
 			else:
@@ -395,13 +405,15 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 					msg_loop += 1
 					time.sleep(0.2)
 					if msg_loop > 25:
-						self.log.info("Job queue filler process (%s). In-Flight: %s, waiting: %s (out: %s, in: %s). Runstate: %s",
-							mode,
-							self.active_jobs,
-							self.normal_out_queue.qsize(),
-							self.jobs_out,
-							self.jobs_in,
-							self.run_flag.value==1)
+
+						with self.count_lock:
+							self.log.info("Job queue filler process (%s). In-Flight: %s, waiting: %s (out: %s, in: %s). Runstate: %s",
+								mode,
+								self.active_jobs,
+								self.normal_out_queue.qsize(),
+								self.jobs_out,
+								self.jobs_in,
+								self.run_flag.value==1)
 						retries  = 0
 						msg_loop = 0
 			except psycopg2.Error:
@@ -423,7 +435,8 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		except queue.Empty:
 			pass
 
-		self.log.info("Job queue filler process. Current job queue size: %s. ", self.active_jobs)
+		with self.count_lock:
+			self.log.info("Job queue filler process. Current job queue size: %s. ", self.active_jobs)
 		self.log.info("Job queue fetcher halted.")
 
 
@@ -441,12 +454,15 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 
 		msg_loop = 0
 		while self.run_flag.value == 1:
+			print("Drainer looping@")
 			self.process_responses()
 
 			msg_loop += 1
 			time.sleep(0.2)
 			if msg_loop > 25:
-				self.log.info("Job queue filler process. Current job queue size: %s (out: %s, in: %s). Runstate: %s", self.active_jobs, self.jobs_out, self.jobs_in, self.run_flag.value==1)
+
+				with self.count_lock:
+					self.log.info("Job queue filler process. Current job queue size: %s (out: %s, in: %s). Runstate: %s", self.active_jobs, self.jobs_out, self.jobs_in, self.run_flag.value==1)
 				msg_loop = 0
 				with self.limiter_lock:
 					self.ratelimiter.job_reduce()
@@ -462,7 +478,8 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		except queue.Empty:
 			pass
 
-		self.log.info("Job queue filler process. Current job queue size: %s. ", self.active_jobs)
+		with self.count_lock:
+			self.log.info("Job queue filler process. Current job queue size: %s. ", self.active_jobs)
 		self.log.info("Job queue fetcher halted.")
 
 	def _get_task_internal(self, mode):
@@ -657,16 +674,18 @@ class RawJobFetcher(LogBase.LoggerMixin, StatsdMixin.StatsdMixin):
 		self.local.db_interface.commit()
 
 	def get_status(self):
-		if any([tmp.is_alive() for tmp in self.fetch_procs]):
-			return "Worker: %s, alive: %s, control: %s, last_rx: %s, active_jobs: %s, jobs_out: %s, jobs_in: %s." % (
-					[tmp.ident for tmp in self.fetch_procs],
-					[tmp.is_alive() for tmp in self.fetch_procs],
-					self.run_flag.value,
-					self.last_rx,
-					self.active_jobs,
-					self.jobs_out,
-					self.jobs_in,
-				)
+		if any([tmp.is_alive() for tmp in self.fetch_procs.values()]):
+
+			with self.count_lock:
+				return "Worker: %s, alive: %s, control: %s, last_rx: %s, active_jobs: %s, jobs_out: %s, jobs_in: %s." % (
+						[tmp.ident for tmp in self.fetch_procs.values()],
+						[tmp.is_alive() for tmp in self.fetch_procs.values()],
+						self.run_flag.value,
+						self.last_rx,
+						self.active_jobs,
+						self.jobs_out,
+						self.jobs_in,
+					)
 
 
 

@@ -56,6 +56,7 @@ GLOBAL_BAD_URLS = [
 			'box5113.temp.domains',
 			'attorneykings.gdn',
 			's2ba7sw2d.us-02.live-paas.net',
+			'getcopyfight.com',
 
 			# Tumblr can seriously go fuck itself with a rusty stake
 			'tumblr.com/widgets/',
@@ -112,7 +113,6 @@ GLOBAL_BAD_URLS = [
 			'app3.letitbefaster.world',
 			'app4.letitbefaster.world',
 			'install.shopping-day.com',
-			'pastebin.com',
 			'ww1.absurdtl.com',
 			'ww1.avertranslation.org',
 			'ww1.catingham-palace.com',
@@ -184,6 +184,9 @@ GLOBAL_BAD_URLS = [
 			'Special:WhatLinksHere',
 			'/User:',
 			'.cfm?fp=',
+
+			'automattic.com',
+			'avatars.jurko.net',
 	]
 
 
@@ -335,7 +338,7 @@ NU_NEW_MASK_NETLOCS = [
 			'www.alphapolis.co',
 			'www.muabeyond.com',
 			'www.weebly.com',
-
+			'tunemywebsite.com',
 
 		]
 
@@ -351,6 +354,9 @@ RSS_TITLE_FILTER = [
 
 # Goooooo FUCK YOURSELF
 GLOBAL_INLINE_BULLSHIT = [
+			'(This chapter is provided to you by Re:Library)',
+			'(Show us your support by paying Re:Library a visit!)'
+			'(If you are reading this, that means this content is stolen. Please support us by visiting our site.)',
 			"Read the original on https://dao.ist",
 			"Property of Fantasy-Books.live | outside of it, it is stolen.",
 			"This translation is property of Infinite Novel Translations.",

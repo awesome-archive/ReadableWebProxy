@@ -8,7 +8,7 @@ addpath = os.path.abspath("./ndscheduler")
 if addpath not in sys.path:
 	sys.path.append(os.path.abspath("./ndscheduler"))
 
-from ndscheduler import job
+from ndscheduler.corescheduler import job
 
 import WebMirror.TimedTriggers.RollingRewalkTriggers
 import WebMirror.TimedTriggers.UrlTriggers
@@ -45,6 +45,10 @@ class PythonJob():
 class PriorityDropper():
 	def go(self):
 		common.management.WebMirrorManage.exposed_drop_priorities()
+
+class RssHistoryPurgerRunner():
+	def go(self):
+		common.management.WebMirrorManage.exposed_clear_rss_history()
 
 
 class RssTriggerJob(PythonJob, job.JobBase):
@@ -85,4 +89,7 @@ class NuHeaderJob(PythonJob, job.JobBase):
 
 class WebMirrorPriorityDropper(PythonJob, job.JobBase):
 	invokable = PriorityDropper
+
+class RssHistoryPurger(PythonJob, job.JobBase):
+	invokable = RssHistoryPurgerRunner
 

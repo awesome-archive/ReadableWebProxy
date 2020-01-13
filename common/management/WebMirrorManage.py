@@ -24,6 +24,9 @@ import sqlalchemy.exc
 import sqlalchemy.orm.exc
 from sqlalchemy_continuum_vendored.utils import version_table
 
+from WebMirror.processor.RssProcessor import RssProcessor
+
+
 if __name__ == "__main__":
 	import logSetup
 	logSetup.initLogging()
@@ -49,6 +52,7 @@ import Misc.HistoryAggregator.Consolidate
 import Misc.NuForwarder.NuHeader
 import flags
 
+import common.util.urlFuncs as urlFuncs
 
 from common.Exceptions import GarbageDomainSquatterException
 import WebMirror.processor.HtmlProcessor
@@ -56,6 +60,7 @@ import WebMirror.TimedTriggers.RollingRewalkTriggers
 import WebMirror.TimedTriggers.QueueTriggers
 import WebMirror.SiteSync.fetch
 import WebMirror.OutputFilters.rss.FeedDataParser
+from WebMirror.OutputFilters.util.TitleParsers import extractVolChapterFragmentPostfix
 
 
 
@@ -247,11 +252,11 @@ def exposed_longest_rows():
 	Return is limited to the biggest 50 rows.
 	VERY SLOW (has to scan the entire table)
 	'''
-	with db.session_context() as sess:
+	with db.session_context(override_timeout_ms=1000 * 60 * 60 * 12) as sess:
 		print("Getting longest rows from database")
 		have = sess.execute("""
 			SELECT
-				id, url, length(content), content
+				id, url, length(content)
 			FROM
 				web_pages
 			ORDER BY
@@ -266,18 +271,18 @@ def exposed_longest_rows():
 			json.dump(have, fp, indent=4)
 
 		savepath = "./large_files/"
-		for row in have[50:]:
-			print(row[0], row[1])
-			try:
-				os.makedirs(savepath)
-			except FileExistsError:
-				pass
-			with open(os.path.join(savepath, "file %s.txt" % row[0]), "wb") as fp:
-				urlst = "URL: %s\n\n" % row[1]
-				size = "Length: %s\n\n" % row[2]
-				fp.write(urlst.encode("utf-8"))
-				fp.write(size.encode("utf-8"))
-				fp.write("{}".format(row[3]).encode("utf-8"))
+		for row in have[150:]:
+			print(row[0], row[1], row[2])
+			# try:
+			# 	os.makedirs(savepath)
+			# except FileExistsError:
+			# 	pass
+			# with open(os.path.join(savepath, "file %s.txt" % row[0]), "wb") as fp:
+			# 	urlst = "URL: %s\n\n" % row[1]
+			# 	size = "Length: %s\n\n" % row[2]
+			# 	fp.write(urlst.encode("utf-8"))
+			# 	fp.write(size.encode("utf-8"))
+			# 	fp.write("{}".format(row[3]).encode("utf-8"))
 
 def exposed_fix_null():
 	'''
@@ -346,11 +351,11 @@ def delete_internal(sess, ids, netloc, badwords, show_badword=True, chunk_size=1
 						except IndexError:
 							ex = None
 
+					if ex:
+						pbar.write("Example removed URL: '%s'" % (ex))
 
-					pbar.write("Example removed URL: '%s'" % (ex))
-
-					triggered = [tmp for tmp in badwords if ex and tmp in ex]
-					pbar.write("Triggering badwords: '%s'" % triggered)
+					# triggered = [tmp for tmp in badwords if ex and tmp in ex]
+					# pbar.write("Triggering badwords: '%s'" % triggered)
 
 				if triggered :
 					q1 = sess.query(db.WebPages).filter(db.WebPages.id.in_(chunk))
@@ -360,8 +365,45 @@ def delete_internal(sess, ids, netloc, badwords, show_badword=True, chunk_size=1
 					affected_rows_ver = q2.delete(synchronize_session=False)
 
 					sess.commit()
-					pbar.write("Deleted %s rows (%s version table rows) for netloc %s. %0.2f%% done." %
+					pbar.set_description("Deleted %s rows (%s version table rows) for netloc %s. %0.2f%% done." %
 							(affected_rows_main, affected_rows_ver, netloc, 100 * ((chunk_idx) / len(ids))))
+				break
+			except sqlalchemy.exc.InternalError:
+				pbar.write("Transaction error (sqlalchemy.exc.InternalError). Retrying.")
+				sess.rollback()
+			except sqlalchemy.exc.OperationalError:
+				pbar.write("Transaction error (sqlalchemy.exc.OperationalError). Retrying.")
+				traceback.print_exc()
+				sess.rollback()
+			except sqlalchemy.exc.IntegrityError:
+				pbar.write("Transaction error (sqlalchemy.exc.IntegrityError). Retrying.")
+				sess.rollback()
+			except sqlalchemy.exc.InvalidRequestError:
+				pbar.write("Transaction error (sqlalchemy.exc.InvalidRequestError). Retrying.")
+				traceback.print_exc()
+				sess.rollback()
+
+
+def delete_internal_urls(sess, urls, chunk_size=1000):
+
+	pbar = tqdm.tqdm(range(0, len(urls), chunk_size))
+	for chunk_idx in pbar:
+		chunk = urls[chunk_idx:chunk_idx+chunk_size]
+		while 1:
+			try:
+				ctbl = version_table(db.WebPages.__table__)
+
+				pbar.write("Example removed URL: '%s'" % (chunk[0], ))
+
+				q1 = sess.query(db.WebPages).filter(db.WebPages.url.in_(chunk))
+				affected_rows_main = q1.delete(synchronize_session=False)
+
+				q2 = sess.query(ctbl).filter(ctbl.c.url.in_(chunk))
+				affected_rows_ver = q2.delete(synchronize_session=False)
+
+				sess.commit()
+				pbar.set_description("Deleted %s rows (%s version table rows). %0.2f%% done." %
+						(affected_rows_main, affected_rows_ver, 100 * ((chunk_idx) / len(urls))))
 				break
 			except sqlalchemy.exc.InternalError:
 				pbar.write("Transaction error (sqlalchemy.exc.InternalError). Retrying.")
@@ -630,48 +672,107 @@ class RuleManager():
 		else:
 			return any([badword in url for badword in self.global_bad])
 
-def exposed_streaming_purge_invalid_urls():
+def exposed_streaming_save_invalid_urls():
 	'''
 	Stream the URLs in the database, and filter them on the fly.
 
 	The resulting row IDs and URLs are then dumped to a json file for further processing.
 	'''
 
-	print("Purge invalid URLs called with netloc param: '%s'" % selected_netloc)
+	print("Purge invalid URLs")
 
 	rulemgr = RuleManager()
 
 	badids = []
+	dumpfile = 1
+	bad_tot = 1
+	try:
+		with db.session_context(name="query_sess", override_timeout_ms=1000 * 60 * 60 * 12) as sess:
+			print("Counting items in table")
+			# total_items = 1156178620
+			total_items = sess.query(db.WebPages.id).count()
+			print("Table contains %s items" % (total_items, ))
 
-	with db.session_context(name="query_sess", override_timeout_ms=1000 * 60 * 30) as sess:
-		print("Counting items in table")
-		total_items = sess.query(db.WebPages).count()
-		print("Table contains %s items" % (total_items, ))
+			ids = sess.query(db.WebPages.id, db.WebPages.url) \
+				.yield_per(50000)
 
-		ids = sess.query(db.WebPages.id, db.WebPages.url) \
-			.yield_per(50000)
+			pbar = tqdm.tqdm(ids, total=total_items)
+			scanned = 0
+			out_sampler = 0
+			for rid, url in pbar:
+				if not urlFuncs.cleanUrl(url):
+					# print("Bad:", url)
+					badids.append((rid, url))
+					if out_sampler == 5000:
+						pbar.write("Unclean URL: %s" % (url, ))
+						out_sampler = 0
+					bad_tot += 1
+					out_sampler += 1
+				else:
+					parsed = urllib.parse.urlparse(url)
+					nl = parsed.netloc
+					if rulemgr.is_bad(nl, url):
+						# print("Bad URL: ", url)
+						badids.append((rid, url))
+						if out_sampler == 5000:
+							pbar.write("Bad URL: %s" % (url, ))
+							out_sampler = 0
+						bad_tot += 1
+						out_sampler += 1
 
-		pbar = tqdm.tqdm(ids, total=total_items)
-		scanned = 0
-		for rid, url in pbar:
-			parsed = urllib.parse.urlparse(url)
-			nl = parsed.netloc
-			if rulemgr.is_bad(nl, url):
-				# print("Bad URL: ", url)
-				badids.append((rid, url))
-			scanned += 1
-			pbar.set_description('Accumulated BadIds: %6i, or %0.2f%%' % (len(badids), (len(badids)/scanned) * 100))
+				scanned += 1
+				pbar.set_description('Accumulated BadIds: %6i (%6i unsaved), or %0.2f%%' % (bad_tot, len(badids), (bad_tot/scanned) * 100))
+
+				if len(badids) > 100 * 1000:
+					fout = "bad/bad-ids-%s.json" % dumpfile
+					pbar.write("Writing to save file %s" % fout)
+					with open(fout, "w") as fp:
+						json.dump(badids, fp, indent=4)
+					badids = []
+					dumpfile += 1
+
+	except KeyboardInterrupt:
+		print("Interrupt! Dumping to json!")
+
 
 	if badids:
-		with open("bad-ids.json", "w") as fp:
-			json.dump(badids, fp)
-
+		with open("bad/bad-ids-%s.json" % dumpfile, "w") as fp:
+			json.dump(badids, fp, indent=4)
 		# print("Deleting rows.")
 		# with db.session_context(name="del_sess", override_timeout_ms = 5 * 60 * 1000) as del_sess:
 		# 	delete_internal(del_sess, badids, "None", [], show_badword=False)
 		# 	del_sess.commit()
 		# deleted += len(badids)
 		# badids = []
+
+
+
+def exposed_streaming_purge_invalid_urls_from_file():
+	'''
+	Stream the URLs in the database, and filter them on the fly.
+
+	The resulting row IDs and URLs are then dumped to a json file for further processing.
+	'''
+
+	for x in range(1, 50000):
+
+		print("Loading from json file")
+		with open("bad/bad-ids-%s.json" % x, "r") as fp:
+			ids_list = json.load(fp)
+		print("Bad items: ", len(ids_list))
+
+		badurls = [url for rowid, url in ids_list]
+
+		print("Deleting rows.")
+		with db.session_context(name="del_sess", override_timeout_ms = 15 * 60 * 1000) as del_sess:
+			delete_internal_urls(
+					sess         = del_sess,
+					urls         = badurls,
+					chunk_size   = 100,
+				)
+			del_sess.commit()
+
+
 
 def exposed_purge_invalid_url_history():
 	'''
@@ -1067,6 +1168,12 @@ def exposed_flatten_fix_missing_history():
 	'''
 	Misc.HistoryAggregator.Consolidate.consolidate_history()
 	Misc.HistoryAggregator.Consolidate.fix_missing_history()
+
+def exposed_delta_compress_history():
+	'''
+	Do delta compression on history items.
+	'''
+	Misc.HistoryAggregator.Consolidate.do_delta_compression()
 
 def exposed_clear_rss_history():
 	'''
@@ -1559,6 +1666,7 @@ def get_high_priority_urls():
 
 		page_items = sess.query(db.WebPages.url)                 \
 			.filter(db.WebPages.priority <= db.DB_HIGH_PRIORITY) \
+			.filter(db.WebPages.is_text  == True)                \
 			.yield_per(10000)                                    \
 			.all()
 
@@ -1577,9 +1685,10 @@ def get_distance_of_zero_urls():
 	print("Loading short-distance netlocs")
 	with db.session_context() as sess:
 
-		page_items = sess.query(db.WebPages.url)                 \
+		page_items = sess.query(db.WebPages.url)                \
 			.filter(db.WebPages.distance <= db.DB_DEFAULT_DIST) \
-			.yield_per(10000)                                    \
+			.filter(db.WebPages.is_text  == True)               \
+			.yield_per(10000)                                   \
 			.all()
 
 		mapdict = {}
@@ -1617,8 +1726,21 @@ def filter_get_have_url(netloc_dict, fetch_title):
 
 			if not netloc:
 				continue
+
+			netloc = netloc.lower()
+
+			if urlFuncs.SQUATTER_NETLOC_RE.match(netloc):
+				continue
+
 			if netloc in common.global_constants.NU_NEW_MASK_NETLOCS:
 				continue
+
+			if netloc.endswith(".photobucket.com"):
+				continue
+			if netloc.endswith(".postimg.org"):
+				continue
+
+
 			if any([tmp in netloc for tmp in common.global_constants.GLOBAL_BAD_URLS]):
 				continue
 
@@ -1643,6 +1765,11 @@ def filter_get_have_url(netloc_dict, fetch_title):
 
 			if WebMirror.OutputFilters.util.feedNameLut.getNiceName(sess, srcurl=None, netloc=netloc):
 				continue
+
+			# Try to check www./non-www. URLs
+			if netloc.startswith("www."):
+				if WebMirror.OutputFilters.util.feedNameLut.getNiceName(sess, srcurl=None, netloc=netloc[4:]):
+					continue
 
 			if netloc in starturldict:
 				continue
@@ -1706,8 +1833,6 @@ def exposed_new_from_all_feeds(fetch_title=False):
 
 
 def exposed_purge_squatter_content():
-
-
 	proc = WebMirror.processor.HtmlProcessor.HtmlPageProcessor(
 			baseUrls        = None,
 			pageUrl         = None,
@@ -1718,10 +1843,8 @@ def exposed_purge_squatter_content():
 			destyle         = None,
 			preserveAttrs   = None,
 			decompose_svg   = None,
-
 			decompose       = [],
 			decomposeBefore = [],
-
 		)
 
 	engine = WebMirror.Engine.SiteArchiver(None, None, None)

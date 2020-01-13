@@ -214,6 +214,8 @@ def unwrap_redirect(urlin, resolve_redirects=True):
 
 
 fuyukai_squatter_re = re.compile(r'www\.fuyukai\.club/[a-z]\d+[A-Z]/')
+gilegati_squatter_re = re.compile(r'novel\.gilegati\.com/[a-zA-Z0-9]+\.(html|php|xml)')
+silversrise_squatter_re = re.compile(r'www\.silversrise\.com/[a-zA-Z0-9]+/([a-zA-Z0-9]+/|[a-z0-9]+\.html)')
 def cleanUrl(urlin):
 	# Fucking tumblr redirects.
 	if urlin.startswith("https://www.tumblr.com/login"):
@@ -226,14 +228,26 @@ def cleanUrl(urlin):
 		return None
 
 
-	if 'www.fuyukai.club' in parsed.netloc:
+	if parsed.netloc.endswith('www.fuyukai.club'):
+		if fuyukai_squatter_re.search(urlin):
+			return None
+
+	if parsed.netloc.endswith('novel.gilegati.com'):
+		if gilegati_squatter_re.search(urlin):
+			return None
+
+	if parsed.netloc.endswith('www.silversrise.com'):
+		if silversrise_squatter_re.search(urlin):
+			return None
+
+	if  parsed.netloc.endswith('.cloudfront.net'):
 		if fuyukai_squatter_re.search(urlin):
 			return None
 
 	if 'tumblr.com' in parsed.netloc and urlin.endswith("/amp"):
 		return None
 
-	if 'wp.me' in parsed.netloc:
+	if parsed.netloc.endswith('wp.me'):
 		resolve_redirects = True
 	if 'feedproxy.google.com' in parsed.netloc:
 		resolve_redirects = True
@@ -352,7 +366,7 @@ def hasDuplicateSegments(url):
 				try:
 					idx = pathchunks.index(bad_chunk)
 					if len(pathchunks) - idx > 2:
-						print("Bad:", pathchunks, idx)
+						# print("Bad:", pathchunks, idx)
 						return True
 				except ValueError:
 					pass
